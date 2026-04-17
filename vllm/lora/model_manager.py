@@ -515,13 +515,78 @@ class LoRAModelManager:
                 parts = module_name.split(".")
                 replacements = self.packed_modules_mapping[parts[-1]]
                 subloras: list[LoRALayerWeights | None] = []
+                n_stacked = len(module.lora_b_stacked)
+                n_replacements = len(replacements)
                 for i, r in enumerate(replacements):
+                    if n_stacked > n_replacements:
+                        # When the number of lora_b_stacked slices
+                        # exceeds the number of replacements (e.g.
+                        # Qwen3.5 in_proj_qkvz has 4 output slices but
+                        # only 2 packed modules), use the *unsharded*
+                        # output_sizes to compute the correct output_dim
+                        # for each replacement.
+                        # Use the base layer's output_sizes to figure
+                        # out how to group slices per replacement.
+                        output_sizes = getattr(
+                            getattr(module, "base_layer", None),
+                            "output_sizes", None)
+                        if output_sizes is not None:
+                            # Greedily assign slices to each replacement
+                            # by accumulating output_sizes until the
+                            # remaining replacements can each get at
+                            # least one slice.
+                            if not hasattr(
+                                self, "_slice_assignment_cache"
+                            ):
+                                self._slice_assignment_cache = {}
+                            cache_key = (module_name, tuple(output_sizes),
+                                         n_replacements)
+                            if cache_key not in self._slice_assignment_cache:
+                                # Build assignment: for each replacement,
+                                # determine which slices it covers.
+                                # Last replacement gets all remaining.
+                                assignment = []
+                                s = 0
+                                for ri in range(n_replacements):
+                                    if ri == n_replacements - 1:
+                                        assignment.append(
+                                            list(range(s, n_stacked)))
+                                        break
+                                    # Give this replacement at least 1
+                                    # slice, but leave enough for the
+                                    # remaining replacements.
+                                    max_take = (n_stacked - s
+                                                - (n_replacements - ri - 1))
+                                    # Take slices greedily: for Qwen3.5,
+                                    # first replacement takes all but 1
+                                    assignment.append(
+                                        list(range(s, s + max_take)))
+                                    s += max_take
+                                self._slice_assignment_cache[
+                                    cache_key] = assignment
+                            slices_for_rep = (
+                                self._slice_assignment_cache[cache_key][i])
+                            output_dim = sum(
+                                output_sizes[j] for j in slices_for_rep)
+                            first_s = slices_for_rep[0]
+                            input_dim = (
+                                module.lora_a_stacked[first_s].shape[-1])
+                            dtype = module.lora_a_stacked[first_s].dtype
+                        else:
+                            # Fallback: use stacked shapes directly
+                            output_dim = module.lora_b_stacked[i].shape[-2]
+                            input_dim = module.lora_a_stacked[i].shape[-1]
+                            dtype = module.lora_a_stacked[i].dtype
+                    else:
+                        output_dim = module.lora_b_stacked[i].shape[-2]
+                        input_dim = module.lora_a_stacked[i].shape[-1]
+                        dtype = module.lora_a_stacked[i].dtype
                     lora = LoRALayerWeights.create_dummy_lora_weights(
                         module_name + "." + r,
-                        module.lora_a_stacked[i].shape[-1],
-                        module.lora_b_stacked[i].shape[-2],
+                        input_dim,
+                        output_dim,
                         rank,
-                        module.lora_a_stacked[i].dtype,
+                        dtype,
                         "cpu",
                     )
                     subloras.append(lora)

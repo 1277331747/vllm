@@ -283,10 +283,22 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         packed_modules_list: list,
         model_config: PretrainedConfig | None = None,
     ) -> bool:
-        return (
-            type(source_layer) is MergedColumnParallelLinear
-            and len(packed_modules_list) == 2
-        )
+        if (
+            type(source_layer) is not MergedColumnParallelLinear
+            or len(packed_modules_list) != 2
+        ):
+            return False
+        # If the layer has 3+ output sizes but only 2 packed modules,
+        # defer to MergedColumnParallelLinearVariableSliceWithLoRA
+        # which can handle the mismatch (e.g. Qwen3.5's in_proj_qkvz
+        # with packed_modules=["in_proj_qkv", "in_proj_z"] but
+        # output_sizes=[key_dim, key_dim, value_dim, value_dim]).
+        if (
+            hasattr(source_layer, "output_sizes")
+            and len(source_layer.output_sizes) >= 3
+        ):
+            return False
+        return True
 
 
 class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
@@ -613,9 +625,17 @@ class MergedColumnParallelLinearVariableSliceWithLoRA(
         if len(packed_modules_list) >= 3:
             return True
 
-        # If packed_modules_list has exactly 2 items, let
-        # MergedColumnParallelLinearWithLoRA handle it
+        # If packed_modules_list has exactly 2 items, check if the layer's
+        # output_sizes has more slices than packed_modules_list.
+        # This handles cases like Qwen3.5's in_proj_qkvz where
+        # packed_modules_list=["in_proj_qkv", "in_proj_z"] (2 items) but
+        # output_sizes=[key_dim, key_dim, value_dim, value_dim] (4 slices).
         if len(packed_modules_list) == 2:
+            if (
+                hasattr(source_layer, "output_sizes")
+                and len(source_layer.output_sizes) >= 3
+            ):
+                return True
             return False
 
         # If packed_modules_list is empty or has 1 item,
@@ -633,12 +653,20 @@ class MergedColumnParallelLinearVariableSliceWithLoRA(
         lora_a: torch.Tensor | list[torch.Tensor],
         lora_b: torch.Tensor | list[torch.Tensor],
     ):
-        """Override to handle single tensor weights
-        that need to be split into slices."""
+        """Override to handle cases where the number of packed LoRA
+        modules differs from the number of output slices.
+
+        For example, Qwen3.5's in_proj_qkvz has 4 output slices
+        (output_sizes=[key_dim, key_dim, value_dim, value_dim]) but
+        only 2 packed modules (["in_proj_qkv", "in_proj_z"]).
+        This method expands the 2-element lora_b list into a 4-element
+        list by splitting each element according to the base layer's
+        output_sizes.
+        """
         self.reset_lora(index)
 
         # Handle case where checkpoint has single tensor weights
-        # lora_a shape: (rank, input_size) - same for all slices, duplicate it
+        # lora_a shape: (rank, input_size) - same for all slices
         if isinstance(lora_a, torch.Tensor):
             lora_a = [lora_a] * self.n_slices
 
@@ -654,5 +682,58 @@ class MergedColumnParallelLinearVariableSliceWithLoRA(
                 start_idx = end_idx
             lora_b = lora_b_list
 
-        # Now call parent's set_lora which expects lists
-        super().set_lora(index, lora_a, lora_b)
+        # Handle case where packed_modules_list has fewer items than
+        # output_sizes (e.g. 2 packed modules but 4 output slices).
+        # Each packed module's lora_b needs to be split according to
+        # the corresponding output_sizes.
+        if isinstance(lora_b, list) and len(lora_b) < self.n_slices:
+            output_sizes = self.base_layer.output_sizes
+            expanded_lora_a: list[torch.Tensor | None] = []
+            expanded_lora_b: list[torch.Tensor | None] = []
+            slice_idx = 0
+            for pack_idx, (a_i, b_i) in enumerate(zip(lora_a, lora_b)):
+                if a_i is None or b_i is None:
+                    # Use greedy assignment: last pack gets all
+                    # remaining slices.
+                    remaining_packs = len(lora_b) - pack_idx
+                    if pack_idx == len(lora_b) - 1:
+                        n_sub = self.n_slices - slice_idx
+                    else:
+                        n_sub = (self.n_slices - slice_idx
+                                 - (remaining_packs - 1))
+                    for _ in range(n_sub):
+                        expanded_lora_a.append(None)
+                        expanded_lora_b.append(None)
+                        slice_idx += 1
+                else:
+                    # Figure out how many output slices this packed
+                    # module covers by matching the total output size
+                    b_out_size = b_i.shape[0]
+                    accumulated = 0
+                    sub_slices = []
+                    while (slice_idx < self.n_slices
+                           and accumulated < b_out_size):
+                        os = output_sizes[slice_idx]
+                        sub_slices.append(
+                            (accumulated, accumulated + os))
+                        accumulated += os
+                        slice_idx += 1
+                    for start, end in sub_slices:
+                        expanded_lora_a.append(a_i)
+                        expanded_lora_b.append(b_i[start:end, :])
+            lora_a = expanded_lora_a
+            lora_b = expanded_lora_b
+
+        if self.tp_size > 1:
+            lora_a = self.slice_lora_a(lora_a)
+            lora_b = self.slice_lora_b(lora_b)
+
+        for i in range(self.n_slices):
+            if (lora_a_i := lora_a[i]) is not None:
+                self.lora_a_stacked[i][
+                    index, 0, : lora_a_i.shape[0], : lora_a_i.shape[1]
+                ].copy_(lora_a_i, non_blocking=True)
+            if (lora_b_i := lora_b[i]) is not None:
+                self.lora_b_stacked[i][
+                    index, 0, : lora_b_i.shape[0], : lora_b_i.shape[1]
+                ].copy_(lora_b_i, non_blocking=True)
